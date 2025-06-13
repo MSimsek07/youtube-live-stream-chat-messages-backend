@@ -2,78 +2,59 @@ import pytchat
 from datetime import datetime
 import os
 import sys
-import csv
-from pymongo.mongo_client import MongoClient
-from pymongo.server_api import ServerApi
-import re
+import csv # Still needed for the service if it uses csv writer directly, but not here
+import re # Not used here anymore
+from config import db, CHAT_LOG_DIR # Import db and CHAT_LOG_DIR for dependency injection
+from services.message_writer_service import MessageWriterService
 
-MONGO_URI = os.environ.get("MONGO_URI") or "mongodb+srv://developer_mu:2kGjFiHrnTXOLsRe@yt-cluster.lmgbl7c.mongodb.net/?retryWrites=true&w=majority&appName=yt-cluster"
-mongo_client = MongoClient(MONGO_URI, server_api=ServerApi('1'))
-db = mongo_client["yt_live_chat"]
+# get_messages_collection is removed as MessageWriterService handles DB collection.
+# CHAT_LOG_DIR and create_chat_log_file are used by MessageWriterService.
 
-def get_messages_collection(video_id):
-    return db[f"messages_{video_id}"]
-
-CHAT_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_csv_files")
-if not os.path.exists(CHAT_LOG_DIR):
-    os.makedirs(CHAT_LOG_DIR)
-
-def create_chat_log_file(video_id):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"chat_log_{video_id}_{timestamp}.csv"
-    filepath = os.path.join(CHAT_LOG_DIR, filename)
-    # Create CSV with headers
-    with open(filepath, 'w', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file)
-        writer.writerow(['datetime', 'author', 'message', 'superChat'])
-    return filepath
-
-def parse_chat_line(line, video_id):
-    match = re.match(r"^([\d-]+ [\d:]+) \[(.+?)\]- (.*)$", line)
-    if not match:
-        return None
-    datetime_str, author, text = match.groups()
-    return {
-        "video_id": video_id,
-        "datetime": datetime_str,
-        "author": author.strip(),
-        "text": text.strip(),
-    }
+# parse_chat_line function was here, removed as it was unused.
 
 def store_chat_messages(video_id):
     chat = pytchat.create(video_id=video_id)
-    filename = create_chat_log_file(video_id)
-    print(f"Storing chat messages in {filename}")
-    messages_collection = get_messages_collection(video_id)
+
+    # Instantiate the message writer service
+    # This will also create the initial CSV file and set up MongoDB collection
+    try:
+        # Pass db and CHAT_LOG_DIR to the service constructor
+        writer_service = MessageWriterService(video_id=video_id, db_client=db, chat_log_directory=CHAT_LOG_DIR)
+    except Exception as e:
+        print(f"Error initializing MessageWriterService: {e}")
+        # Depending on how MessageWriterService handles init errors (e.g., if create_chat_log_file fails),
+        # this might need more robust error handling or the service ensures it can be instantiated.
+        return # Exit if service cannot be initialized
+
+    csv_log_filename = writer_service.get_csv_filepath()
+    print(f"Storing chat messages. CSV: {csv_log_filename}, MongoDB Collection: messages_{video_id}")
+
     try:
         while chat.is_alive():
             for c in chat.get().sync_items():
-                message = {
+                message_data = {
+                    "video_id": video_id, # Ensure video_id is included
                     "datetime": c.datetime,
                     "author": c.author.name,
                     "message": c.message,
                     "superChat": getattr(c, 'amountString', None)
                 }
-                # Write to CSV
-                with open(filename, 'a', newline='', encoding='utf-8') as file:
-                    writer = csv.writer(file)
-                    writer.writerow([
-                        message['datetime'],
-                        message['author'],
-                        message['message'],
-                        message['superChat'] or ''
-                    ])
-                # Store in MongoDB
-                message['video_id'] = video_id
-                messages_collection.insert_one(message)
-                print(f"{message['datetime']} [{message['author']}] - {message['message']}"
-                      f"{' (Superchat: ' + message['superChat'] + ')' if message['superChat'] else ''}")
+
+                # Use the service to write the message
+                writer_service.write_message(message_data)
+
+                # Print to console (as before)
+                print(f"{message_data['datetime']} [{message_data['author']}] - {message_data['message']}"
+                      f"{' (SuperChat: ' + message_data['superChat'] + ')' if message_data['superChat'] else ''}")
+
     except KeyboardInterrupt:
         print("\nStopping chat collection...")
     except Exception as e:
-        print(f"An error occurred: {str(e)}")
+        print(f"An error occurred during chat collection: {str(e)}")
     finally:
-        print(f"\nChat messages have been saved to {filename}")
+        # The CSV file is managed (opened and closed per write or kept open) by the service.
+        # Here, we just confirm where it was being saved.
+        print(f"\nChat messages have been saved to {csv_log_filename} and MongoDB.")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

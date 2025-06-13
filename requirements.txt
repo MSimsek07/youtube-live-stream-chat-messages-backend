@@ -3,3 +3,5 @@ uvicorn
 pytchat
 pymongo
 psutil
+pytest
+httpx

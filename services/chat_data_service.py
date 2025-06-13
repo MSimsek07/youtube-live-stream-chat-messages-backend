@@ -1,0 +1,173 @@
+import os
+import csv
+from datetime import datetime
+from fastapi import HTTPException, JSONResponse
+
+# Dependencies db and CHAT_LOG_DIR will be passed as arguments
+
+def get_messages_collection_name(video_id: str) -> str:
+    """Constructs the MongoDB collection name for a given video_id."""
+    return f"messages_{video_id}"
+
+def list_log_files(chat_log_dir: str) -> list[str]:
+    """Lists all available CSV chat log files in the given chat_log_dir."""
+    try:
+        files = [f for f in os.listdir(chat_log_dir) if f.startswith("chat_log_") and f.endswith(".csv")]
+        return files
+    except FileNotFoundError:
+        # This case should ideally be handled by application setup ensuring chat_log_dir exists
+        # but as a safeguard:
+        return []
+    except Exception as e:
+        print(f"Error listing log files in {chat_log_dir}: {e}")
+        return [] # Or raise an appropriate exception
+
+def get_log_file_messages(filename: str, chat_log_dir: str) -> dict:
+    """Retrieves messages from a specific CSV chat log file in the given chat_log_dir."""
+    filepath = os.path.join(chat_log_dir, filename)
+    if not os.path.exists(filepath) or not os.path.isfile(filepath):
+        raise HTTPException(status_code=404, detail=f"File '{filename}' not found in {chat_log_dir}.")
+
+    messages = []
+    try:
+        with open(filepath, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            next(reader)  # Skip header row
+            for row in reader:
+                if len(row) >= 4:
+                    messages.append({
+                        "datetime": row[0],
+                        "author": row[1],
+                        "message": row[2],
+                        "superChat": row[3]
+                    })
+        return {"messages": messages}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading file '{filename}': {str(e)}")
+
+def get_db_messages(video_id: str, db_client) -> dict:
+    """Retrieves all messages for a video_id from MongoDB using the provided db_client."""
+    collection_name = get_messages_collection_name(video_id)
+    collection = db_client[collection_name]
+    try:
+        msgs = list(collection.find({}, {"_id": 0}))
+        return {"messages": msgs}
+    except Exception as e:
+        # Log the exception e
+        raise HTTPException(status_code=500, detail=f"Error fetching messages from database for {video_id}: {str(e)}")
+
+def _get_latest_chat_log_file_path(video_id: str, chat_log_dir: str) -> str | None:
+    """
+    Internal helper to find the path of the latest chat log CSV file for a video_id
+    in the specified chat_log_dir.
+    """
+    try:
+        files = [f for f in os.listdir(chat_log_dir) if f.startswith(f"chat_log_{video_id}_") and f.endswith(".csv")]
+        if not files:
+            return None
+        latest_file = max(files, key=lambda f: os.path.getctime(os.path.join(chat_log_dir, f)))
+        return os.path.join(chat_log_dir, latest_file)
+    except FileNotFoundError:
+        return None # Should not happen if chat_log_dir is managed properly
+    except Exception as e:
+        print(f"Error finding latest chat log file for {video_id} in {chat_log_dir}: {e}")
+        return None
+
+def import_csv_to_db(video_id: str, db_client, chat_log_dir: str) -> dict:
+    """Imports messages from the latest CSV for a video_id into MongoDB (skips duplicates)."""
+    log_file_path = _get_latest_chat_log_file_path(video_id, chat_log_dir)
+    if not log_file_path:
+        raise HTTPException(status_code=404, detail=f"Chat log file not found for video ID {video_id} in {chat_log_dir}.")
+
+    messages_to_insert = []
+    try:
+        with open(log_file_path, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            next(reader)  # Skip header row
+            for row in reader:
+                if len(row) >= 4:
+                    msg = {
+                        "video_id": video_id,
+                        "datetime": row[0],
+                        "author": row[1],
+                        "message": row[2],
+                        "superChat": row[3]
+                    }
+                    messages_to_insert.append(msg)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading CSV file '{os.path.basename(log_file_path)}': {str(e)}")
+
+    if not messages_to_insert:
+        return {"inserted_count": 0, "message": "No messages to import from CSV."}
+
+    collection_name = get_messages_collection_name(video_id)
+    collection = db_client[collection_name]
+    inserted_count = 0
+
+    # Consider bulk operations for efficiency if dealing with very large CSVs
+    for msg in messages_to_insert:
+        # Check for duplicates based on a combination of fields
+        # This simple check might not be perfectly robust for all edge cases (e.g., clock sync issues)
+        # A more robust approach might involve unique IDs generated by the collector if possible.
+        if not collection.find_one({
+            "video_id": msg["video_id"],
+            "datetime": msg["datetime"],
+            "author": msg["author"],
+            "message": msg["message"] # Comparing full message might be problematic for long messages or slight variations
+        }):
+            try:
+                collection.insert_one(msg)
+                inserted_count += 1
+            except Exception as e:
+                # Log the specific error and message that failed
+                print(f"Failed to insert message for {video_id} into DB: {msg}, Error: {e}")
+                # Depending on requirements, either continue or raise an error
+
+    return {"inserted_count": inserted_count, "message": f"Imported {inserted_count} new messages to MongoDB from {os.path.basename(log_file_path)}."}
+
+def get_latest_csv_messages(video_id: str, chat_log_dir: str) -> dict:
+    """Retrieves all messages from the latest chat log CSV file for a video_id, including a numeric timestamp."""
+    log_file_path = _get_latest_chat_log_file_path(video_id, chat_log_dir)
+    if not log_file_path:
+        raise HTTPException(status_code=404, detail=f"Chat log file not found for video ID {video_id} in {chat_log_dir}.")
+
+    messages = []
+    try:
+        with open(log_file_path, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            next(reader)  # Skip header row
+            for row in reader:
+                if len(row) >= 4:
+                    msg = {
+                        "datetime": row[0],
+                        "author": row[1],
+                        "message": row[2],
+                        "superChat": row[3],
+                        "video_id": video_id
+                    }
+                    try:
+                        # Attempt to parse datetime and create a Unix timestamp (milliseconds)
+                        dt_obj = datetime.strptime(msg["datetime"], "%Y-%m-%d %H:%M:%S")
+                        msg["timestamp"] = int(dt_obj.timestamp() * 1000)
+                    except ValueError: # Handle cases where datetime format might be unexpected
+                        msg["timestamp"] = 0 # Or None, or log an error
+                    except Exception: # Catch any other parsing related error
+                        msg["timestamp"] = 0
+                    messages.append(msg)
+        return {"messages": messages}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading or processing CSV file '{os.path.basename(log_file_path)}': {str(e)}")
+
+
+def analyze_video_messages(video_id: str, db_client) -> dict:
+    """
+    Placeholder for message analysis.
+    Currently returns a count of messages in the database for the video_id using the provided db_client.
+    """
+    collection_name = get_messages_collection_name(video_id)
+    collection = db_client[collection_name]
+    try:
+        count = collection.count_documents({})
+        return {"video_id": video_id, "message_count": count, "analysis_status": "Placeholder - analysis not implemented."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error analyzing messages for {video_id}: {str(e)}")
