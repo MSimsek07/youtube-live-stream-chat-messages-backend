@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+pytchat
+pymongo
+psutil
